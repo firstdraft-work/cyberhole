@@ -369,8 +369,16 @@ class Game{
     });
     this.cvs.addEventListener('mouseup',()=>this.mouseDown=false);
     // 结算画面点击
-    this.cvs.addEventListener('click',()=>{
-      if(this.state===this.STATES.SETTLEMENT)this.startCountdown();
+    this.cvs.addEventListener('click',(e)=>{
+      if(this.state===this.STATES.SETTLEMENT){
+        // 检测是否点击分享按钮
+        const sb=this._shareBtn;
+        if(sb&&e.clientX>=sb.x&&e.clientX<=sb.x+sb.w&&e.clientY>=sb.y&&e.clientY<=sb.y+sb.h){
+          this.shareResult();
+          return;
+        }
+        this.startCountdown();
+      }
     });
   }
 
@@ -416,6 +424,34 @@ class Game{
     this.state=this.STATES.TITLE;
     this.player=null;this.ais=[];this.world=null;
     this.particles=[];this.items=[];
+  }
+
+  shareResult(){
+    const endless=this.gameMode==='endless';
+    const all=[this.player,...this.ais].sort((a,b)=>b.score-a.score);
+    const rank=all.indexOf(this.player)+1;
+    const isWin=endless?this.endlessWin:rank===1;
+
+    let text='🎮 CyberHole 赛博朋克黑洞入侵\n';
+    if(endless){
+      const m=Math.floor(this.endlessTime/60),s=Math.floor(this.endlessTime%60);
+      text+=`存活 ${m}:${String(s).padStart(2,'0')} | 波次 ${this.wave}\n`;
+    }else{
+      const totalScore=this.player.score+(rank===1?1000:rank===2?500:200)+500;
+      text+=`得分 ${totalScore} | 排名 #${rank}\n`;
+    }
+    text+=`吞噬 ${this.objectsEaten} | 连击 ×${this.maxCombo} | 最大R ${this.maxRadius.toFixed(1)}\n`;
+    if(isWin) text+='🏆 ';
+    text+='https://cyberhole.game';
+
+    if(navigator.share){
+      navigator.share({title:'CyberHole',text}).catch(()=>{});
+    }else{
+      navigator.clipboard.writeText(text).then(()=>{
+        this._shareToast='已复制到剪贴板';
+        this._shareToastTimer=2;
+      }).catch(()=>{});
+    }
   }
 
   endGame(manual){
@@ -501,6 +537,8 @@ class Game{
     this.checkAchievements();
     // 成就提示衰减
     if(this.achToast){this.achToast.timer-=dt;if(this.achToast.timer<=0)this.achToast=null;}
+    // 分享提示衰减
+    if(this._shareToastTimer){this._shareToastTimer-=dt;if(this._shareToastTimer<=0){this._shareToast=null;this._shareToastTimer=0;}}
   }
 
   updatePlayer(dt){
@@ -1425,6 +1463,21 @@ class Game{
       ctx.stroke();
     }
 
+    // 分享按钮
+    const shareBtnW=180,shareBtnH=44;
+    const shareBtnX=cw/2-shareBtnW/2,shareBtnY=ch-80;
+    // 存储按钮区域供点击检测
+    this._shareBtn={x:shareBtnX,y:shareBtnY,w:shareBtnW,h:shareBtnH};
+    ctx.fillStyle='rgba(255,0,204,0.12)';
+    ctx.fillRect(shareBtnX,shareBtnY,shareBtnW,shareBtnH);
+    ctx.strokeStyle='#ff00cc';ctx.lineWidth=2;
+    ctx.strokeRect(shareBtnX,shareBtnY,shareBtnW,shareBtnH);
+    ctx.fillStyle='#ff00cc';
+    ctx.font='bold 16px monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('📋 分享成绩',cw/2,shareBtnY+shareBtnH/2);
+    ctx.textBaseline='alphabetic';
+
     // 再来一局（呼吸闪烁）
     const blink=Math.sin(t*3)*0.3+0.7;
     ctx.globalAlpha=blink;
@@ -1433,6 +1486,14 @@ class Game{
     ctx.textAlign='center';
     ctx.fillText('点击再来一局',cw/2,ch-25);
     ctx.globalAlpha=1;
+
+    // 分享成功提示
+    if(this._shareToast){
+      ctx.fillStyle='#ff00cc';
+      ctx.font='bold 16px monospace';
+      ctx.textAlign='center';
+      ctx.fillText(this._shareToast,cw/2,shareBtnY-12);
+    }
   }
 
   // ==================== 主循环 ====================
