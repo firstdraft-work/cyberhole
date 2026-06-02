@@ -479,35 +479,12 @@ class Game{
     if(this.gameMode==='endless'){
       this.endlessTime+=dt;
 
-      // 胜利判定：达到最高等级"城市杀手"
-      if(this.player.radius>=LEVELS[LEVELS.length-1][1]){
+      // 胜利判定：所有AI被吃完
+      if(this.ais.length===0){
         this.endlessWin=true;
         this.state=this.STATES.SETTLEMENT;
         SFX.gameover();
         return;
-      }
-
-      // 难度递进：每20秒加一波，新AI体型随玩家水涨船高
-      this.waveTimer-=dt;
-      if(this.waveTimer<=0){
-        this.waveTimer=20;
-        this.wave++;
-        const types=['greedy','hunter','hunter'];  // 后期更多猎手
-        // 新AI在玩家附近生成，体型 = 玩家体型的 0.7~1.2 倍（总有能威胁玩家的）
-        const px=this.player.x, py=this.player.y;
-        const ang=rand(0,Math.PI*2), spawnDist=600;
-        const newR=Math.max(AI_INIT_RADIUS, this.player.radius*rand(0.7,1.2));
-        this.ais.push(new Hole(
-          clamp(px+Math.cos(ang)*spawnDist,200,W-200),
-          clamp(py+Math.sin(ang)*spawnDist,200,H-200),
-          newR,'#cc44ff',types[this.wave%3]
-        ));
-        // 控制AI总数上限，过多则移除最小的（保持性能+始终有威胁）
-        if(this.ais.length>8){
-          this.ais.sort((a,b)=>a.radius-b.radius);
-          this.ais.shift();
-        }
-        this.spawnParticles(px+Math.cos(ang)*spawnDist,py+Math.sin(ang)*spawnDist,'#cc44ff',20);
       }
     }else{
       this.roundTimer-=dt;
@@ -685,7 +662,15 @@ class Game{
     // 猎手成就：玩家吞掉AI
     if(eater.isPlayer&&!victim.isPlayer) this.unlockAch('hunter','猎手');
 
-    // 重生受害者
+    // 无尽模式：AI被吃直接移除，不重生
+    if(this.gameMode==='endless'&&!victim.isPlayer){
+      const idx=this.ais.indexOf(victim);
+      if(idx>=0) this.ais.splice(idx,1);
+      this.spawnParticles(victim.x,victim.y,victim.color,15);
+      return;
+    }
+
+    // 限时模式：重生受害者
     victim.x=rand(200,W-200);
     victim.y=rand(200,H-200);
     victim.radius=victim.isPlayer?INIT_RADIUS:AI_INIT_RADIUS;
