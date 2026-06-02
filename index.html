@@ -1464,16 +1464,15 @@ class Game{
     }
 
     // 分享按钮
-    const shareBtnW=180,shareBtnH=44;
-    const shareBtnX=cw/2-shareBtnW/2,shareBtnY=ch-80;
-    // 存储按钮区域供点击检测
+    const shareBtnW=180,shareBtnH=40;
+    const shareBtnX=cw/2-shareBtnW/2,shareBtnY=ch-95;
     this._shareBtn={x:shareBtnX,y:shareBtnY,w:shareBtnW,h:shareBtnH};
     ctx.fillStyle='rgba(255,0,204,0.12)';
     ctx.fillRect(shareBtnX,shareBtnY,shareBtnW,shareBtnH);
     ctx.strokeStyle='#ff00cc';ctx.lineWidth=2;
     ctx.strokeRect(shareBtnX,shareBtnY,shareBtnW,shareBtnH);
     ctx.fillStyle='#ff00cc';
-    ctx.font='bold 16px monospace';
+    ctx.font='bold 15px monospace';
     ctx.textAlign='center';ctx.textBaseline='middle';
     ctx.fillText('📋 分享成绩',cw/2,shareBtnY+shareBtnH/2);
     ctx.textBaseline='alphabetic';
@@ -1482,17 +1481,17 @@ class Game{
     const blink=Math.sin(t*3)*0.3+0.7;
     ctx.globalAlpha=blink;
     ctx.fillStyle=isWin?'#ffcc00':'#00ccff';
-    ctx.font='bold 18px monospace';
+    ctx.font='bold 16px monospace';
     ctx.textAlign='center';
-    ctx.fillText('点击再来一局',cw/2,ch-25);
+    ctx.fillText('点击任意位置再来一局',cw/2,ch-25);
     ctx.globalAlpha=1;
 
     // 分享成功提示
     if(this._shareToast){
       ctx.fillStyle='#ff00cc';
-      ctx.font='bold 16px monospace';
+      ctx.font='bold 14px monospace';
       ctx.textAlign='center';
-      ctx.fillText(this._shareToast,cw/2,shareBtnY-12);
+      ctx.fillText(this._shareToast,cw/2,shareBtnY-10);
     }
   }
 
