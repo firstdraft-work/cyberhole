@@ -442,7 +442,7 @@ class Game{
     }
     text+=`吞噬 ${this.objectsEaten} | 连击 ×${this.maxCombo} | 最大R ${this.maxRadius.toFixed(1)}\n`;
     if(isWin) text+='🏆 ';
-    text+='https://cyberhole.game';
+    text+=location.href;
 
     if(navigator.share){
       navigator.share({title:'CyberHole',text}).catch(()=>{});
