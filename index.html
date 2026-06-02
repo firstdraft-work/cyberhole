@@ -1,0 +1,1632 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CyberHole</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;overflow:hidden;font-family:'Courier New',monospace}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ==================== 常量 ====================
+const W=4000,H=4000;                // 世界尺寸
+const BASE_SPEED=200;               // 基础速度 px/s
+const INIT_RADIUS=8;                // 玩家初始半径
+const AI_INIT_RADIUS=10;            // AI 初始半径
+const ROUND_TIME=120;               // 2分钟
+const ABSORB_ANIM=0.3;             // 吞噬动画时长(秒)
+const RESPAWN_DELAY=4;              // 物体重生延迟(秒)
+const COMBO_WINDOW=1;               // 连击窗口(秒)
+const COMBO_ABS_CAP=3;              // 连击绝对上限(秒)
+const EAT_RATIO=1.3;                // 互吃需要的体型比
+const INVINCIBLE_TIME=2;            // 无敌时间(秒)
+const MAX_PARTICLES=300;            // 粒子上限
+const PARTICLE_LIFE=30;             // 粒子存活帧数
+const CELL=200;                     // 空间哈希格子大小
+const AI_VISION=500;                // AI 视野半径
+const AI_SPEED_MULT=0.85;           // AI 速度倍率
+const AI_RETARGET=0.5;              // AI 重评估间隔(秒)
+const DEATH_PENALTY=0.2;            // 被吞扣分比例
+const GROWTH_EFF=0.7;               // 成长效率
+
+// 层级定义 [name, minR, maxR, glowColor]
+const LEVELS=[
+  ['纳米洞',8,21,'#00ccff'],
+  ['街道洞',21,51,'#00ffcc'],
+  ['街区洞',51,121,'#ff00cc'],
+  ['区域洞',121,251,'#ff44ff'],
+  ['城市杀手',251,Infinity,'#ff00ff']
+];
+
+// 原型物体类型 [name, radius, color, count]
+const OBJ_TYPES=[
+  ['路标',6,'#888888',60],
+  ['广告牌',10,'#00ffcc',40],
+  ['小店',35,'#44ff88',25],
+  ['大楼',70,'#ff8844',15],
+  ['巨塔',140,'#ff4444',10],
+];
+
+// ==================== 工具函数 ====================
+function clamp(v,lo,hi){return v<lo?lo:v>hi?hi:v}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+function rand(a,b){return a+Math.random()*(b-a)}
+function randInt(a,b){return Math.floor(rand(a,b+1))}
+function circleArea(r){return Math.PI*r*r}
+function radiusFromArea(a){return Math.sqrt(a/Math.PI)}
+
+function getLevel(r){
+  for(let i=0;i<LEVELS.length;i++){
+    if(r<LEVELS[i][2])return i;
+  }
+  return LEVELS.length-1;
+}
+
+// 速度随半径温和下降，但大黑洞仍保持流畅（最低不低于基础速度的60%）
+function calcSpeed(r){return BASE_SPEED*Math.max(0.6,300/(280+r))}
+function calcZoom(r){return clamp(1/(1+r/400),0.25,1)}
+
+// ==================== 矢量霓虹物体绘制 ====================
+// 零 shadowBlur 版本：用"双描边"（粗半透明 + 细实线）模拟辉光，性能好 10x。
+// neonLine(): 画一条带"假辉光"的线——粗半透明底下 + 细实线上面。
+function neonStroke(ctx,color,lw){
+  // 粗底：半透明宽线模拟辉光
+  ctx.strokeStyle=color;ctx.globalAlpha*=0.35;ctx.lineWidth=lw*3;ctx.stroke();
+  ctx.globalAlpha/=0.35;
+  // 细顶：实线
+  ctx.strokeStyle=color;ctx.lineWidth=lw;ctx.stroke();
+}
+
+// 路标：霓虹菱形 + 立柱
+function drawSign(ctx,r,color){
+  const lw=Math.max(1,r*0.15);
+  ctx.beginPath();
+  ctx.moveTo(0,-r);ctx.lineTo(r*0.7,0);ctx.lineTo(0,r*0.4);ctx.lineTo(-r*0.7,0);ctx.closePath();
+  neonStroke(ctx,color,lw);
+  ctx.beginPath();ctx.moveTo(0,r*0.4);ctx.lineTo(0,r);ctx.stroke();
+}
+
+// 广告牌：发光屏 + 横向扫描线
+function drawBillboard(ctx,r,color){
+  const lw=Math.max(1,r*0.12);
+  ctx.beginPath();ctx.rect(-r,-r*0.7,r*2,r*1.4);
+  neonStroke(ctx,color,lw);
+  ctx.strokeStyle=color;ctx.globalAlpha*=0.4;ctx.lineWidth=Math.max(0.5,r*0.05);
+  for(let y=-r*0.35;y<r*0.6;y+=r*0.35){ctx.beginPath();ctx.moveTo(-r*0.8,y);ctx.lineTo(r*0.8,y);ctx.stroke();}
+  ctx.globalAlpha/=0.4;
+}
+
+// 小店：方块带窗格 + 门
+function drawShop(ctx,r,color){
+  const lw=Math.max(1,r*0.06);
+  ctx.beginPath();ctx.rect(-r,-r,r*2,r*2);
+  neonStroke(ctx,color,lw);
+  // 窗格（简化：只画十字窗）
+  ctx.strokeStyle=color;ctx.globalAlpha*=0.5;ctx.lineWidth=Math.max(0.5,r*0.03);
+  ctx.beginPath();ctx.moveTo(0,-r);ctx.lineTo(0,r);ctx.moveTo(-r,0);ctx.lineTo(r,0);ctx.stroke();
+  ctx.globalAlpha/=0.5;
+  // 门
+  ctx.fillStyle=color;ctx.globalAlpha*=0.3;
+  ctx.fillRect(-r*0.2,r*0.4,r*0.4,r*0.6);ctx.globalAlpha/=0.3;
+}
+
+// 大楼：线框塔 + 楼层线 + 天线
+function drawBuilding(ctx,r,color){
+  const lw=Math.max(1,r*0.04);
+  ctx.beginPath();ctx.rect(-r*0.8,-r,r*1.6,r*2);
+  neonStroke(ctx,color,lw);
+  // 楼层线（只画 3 条，不循环太多）
+  ctx.strokeStyle=color;ctx.globalAlpha*=0.35;ctx.lineWidth=Math.max(0.5,r*0.015);
+  for(let y=-r*0.5;y<r;y+=r*0.5){ctx.beginPath();ctx.moveTo(-r*0.7,y);ctx.lineTo(r*0.7,y);ctx.stroke();}
+  ctx.globalAlpha/=0.35;
+  // 天线
+  ctx.strokeStyle=color;ctx.lineWidth=Math.max(1,r*0.03);
+  ctx.beginPath();ctx.moveTo(0,-r);ctx.lineTo(0,-r*1.35);ctx.stroke();
+  ctx.beginPath();ctx.arc(0,-r*1.35,r*0.06,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();
+}
+
+// 巨塔：双尖塔 + 顶灯
+function drawTower(ctx,r,color){
+  const lw=Math.max(1,r*0.03);
+  for(const s of [-1,1]){
+    ctx.beginPath();
+    ctx.moveTo(s*r*0.3,-r*1.1);ctx.lineTo(s*r*0.5,r);
+    ctx.lineTo(s*r*0.85,r);ctx.lineTo(s*r*0.55,-r*1.1);ctx.closePath();
+    neonStroke(ctx,color,lw);
+  }
+  // 楼层线（各 2 条）
+  ctx.strokeStyle=color;ctx.globalAlpha*=0.3;ctx.lineWidth=Math.max(0.5,r*0.012);
+  for(let y=-r*0.5;y<r;y+=r*0.5){
+    ctx.beginPath();ctx.moveTo(-r*0.7,y);ctx.lineTo(-r*0.35,y);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(r*0.35,y);ctx.lineTo(r*0.7,y);ctx.stroke();
+  }
+  // 连桥
+  ctx.beginPath();ctx.moveTo(-r*0.4,-r*0.15);ctx.lineTo(r*0.4,-r*0.15);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(-r*0.4,r*0.15);ctx.lineTo(r*0.4,r*0.15);ctx.stroke();
+  ctx.globalAlpha/=0.3;
+  // 顶灯
+  ctx.fillStyle=color;
+  ctx.beginPath();ctx.arc(-r*0.42,-r*1.1,r*0.06,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(r*0.42,-r*1.1,r*0.06,0,Math.PI*2);ctx.fill();
+}
+
+const DRAW_FNS={'路标':drawSign,'广告牌':drawBillboard,'小店':drawShop,'大楼':drawBuilding,'巨塔':drawTower};
+
+// ==================== 精灵图缓存（预渲染，每帧只 drawImage） ====================
+const _SC={};       // name|color -> offscreen canvas
+const _SC_SZ=400;   // 精灵 canvas 尺寸（足够容纳巨塔 1.35r 延伸）
+const _SC_R=120;    // 预渲染参考半径
+(function buildSpriteCache(){
+  for(const[name,,color] of OBJ_TYPES){
+    for(const c of [color,'#00ff88']){   // 原色 + 可吞噬绿色
+      const cvs=document.createElement('canvas');
+      cvs.width=cvs.height=_SC_SZ;
+      const ctx=cvs.getContext('2d');
+      ctx.translate(_SC_SZ/2,_SC_SZ/2);
+      DRAW_FNS[name](ctx,_SC_R,c);
+      _SC[name+'|'+c]=cvs;
+    }
+  }
+})();
+
+// ==================== 程序化音效引擎（Web Audio API，零素材） ====================
+const SFX={
+  ctx:null,
+  init(){
+    this.ctx=new(window.AudioContext||window.webkitAudioContext)();
+  },
+  resume(){
+    if(this.ctx&&this.ctx.state==='suspended')this.ctx.resume();
+  },
+  // 吞噬音：短"啵"声，物体越大音调越低
+  eat(objRadius,holeRadius){
+    if(!this.ctx)return;
+    const c=this.ctx,t=c.currentTime;
+    const osc=c.createOscillator();
+    const gain=c.createGain();
+    // 物体占比越大→音调越低，体积感
+    const ratio=objRadius/(holeRadius+1);
+    osc.frequency.setValueAtTime(600-ratio*400,t);
+    osc.frequency.exponentialRampToValueAtTime(200,t+0.12);
+    osc.type='sine';
+    gain.gain.setValueAtTime(0.15,t);
+    gain.gain.exponentialRampToValueAtTime(0.001,t+0.12);
+    osc.connect(gain).connect(c.destination);
+    osc.start(t);osc.stop(t+0.13);
+  },
+  // 连击音：音调随 combo 数上升
+  combo(count){
+    if(!this.ctx)return;
+    const c=this.ctx,t=c.currentTime;
+    const osc=c.createOscillator();
+    const gain=c.createGain();
+    // combo 3→440Hz, 4→660Hz, 5→880Hz
+    osc.frequency.setValueAtTime(330+count*110,t);
+    osc.type='triangle';
+    gain.gain.setValueAtTime(0.12,t);
+    gain.gain.exponentialRampToValueAtTime(0.001,t+0.2);
+    osc.connect(gain).connect(c.destination);
+    osc.start(t);osc.stop(t+0.21);
+  },
+  // 被吞（玩家死亡）
+  death(){
+    if(!this.ctx)return;
+    const c=this.ctx,t=c.currentTime;
+    const osc=c.createOscillator();
+    const gain=c.createGain();
+    osc.frequency.setValueAtTime(400,t);
+    osc.frequency.exponentialRampToValueAtTime(80,t+0.5);
+    osc.type='sawtooth';
+    gain.gain.setValueAtTime(0.2,t);
+    gain.gain.exponentialRampToValueAtTime(0.001,t+0.5);
+    osc.connect(gain).connect(c.destination);
+    osc.start(t);osc.stop(t+0.51);
+  },
+  // 倒计时提示音
+  countdown(val){
+    if(!this.ctx)return;
+    const c=this.ctx,t=c.currentTime;
+    const osc=c.createOscillator();
+    const gain=c.createGain();
+    osc.frequency.setValueAtTime(val>0?520:880,t);
+    osc.type='square';
+    gain.gain.setValueAtTime(0.1,t);
+    gain.gain.exponentialRampToValueAtTime(0.001,t+0.15);
+    osc.connect(gain).connect(c.destination);
+    osc.start(t);osc.stop(t+0.16);
+  },
+  // 游戏结束
+  gameover(){
+    if(!this.ctx)return;
+    const c=this.ctx,t=c.currentTime;
+    [440,330,220].forEach((f,i)=>{
+      const osc=c.createOscillator();
+      const gain=c.createGain();
+      osc.frequency.setValueAtTime(f,t+i*0.2);
+      osc.type='sine';
+      gain.gain.setValueAtTime(0.12,t+i*0.2);
+      gain.gain.exponentialRampToValueAtTime(0.001,t+i*0.2+0.3);
+      osc.connect(gain).connect(c.destination);
+      osc.start(t+i*0.2);osc.stop(t+i*0.2+0.31);
+    });
+  }
+};
+
+// ==================== Class: Game ====================
+class Game{
+  constructor(){
+    this.cvs=document.getElementById('c');
+    this.ctx=this.cvs.getContext('2d');
+    this.resize();
+    window.addEventListener('resize',()=>this.resize());
+
+    // 状态机
+    this.STATES={TITLE:0,COUNTDOWN:1,PLAYING:2,SETTLEMENT:3};
+    this.state=this.STATES.TITLE;
+    this.gameMode='timed';   // 'timed' | 'endless'
+    this.titleSel=0;         // 0=限时赛 1=无尽模式（标题界面光标）
+    this.endlessTime=0;      // 无尽模式存活秒数
+
+    // 计时
+    this.lastT=0;
+    this.time=0;                // 动画时间累加器（旋涡/轨道粒子）
+    this.shake=0;               // 屏幕震动剩余强度
+    this.fps=0;this._fpsT=0;this._fpsN=0;  // FPS 计数器
+    this.countdownVal=3;
+    this.countdownTimer=0;
+    this.roundTimer=ROUND_TIME;
+
+    // 输入
+    this.keys={};
+    this.mouseDown=false;
+    this.mouseDir={x:0,y:0};
+    this.setupInput();
+
+    // 实体
+    this.player=null;
+    this.ais=[];
+    this.world=null;
+    this.particles=[];
+
+    // 计分
+    this.comboCount=0;
+    this.comboStart=0;
+    this.comboLastEat=0;
+    this.maxCombo=0;
+    this.objectsEaten=0;
+    this.maxRadius=INIT_RADIUS;
+    this.growthHistory=[];
+
+    // 成就系统
+    this.unlockedAchievements=JSON.parse(localStorage.getItem('cyberhole_ach')||'{}');
+    this.achToast=null;  // {label, timer}
+
+    // 倒计时数据
+    this.settlementShown=false;
+  }
+
+  resize(){
+    this.cvs.width=innerWidth;
+    this.cvs.height=innerHeight;
+  }
+
+  setupInput(){
+    window.addEventListener('keydown',e=>{
+      this.keys[e.key.toLowerCase()]=true;
+      const k=e.key.toLowerCase();
+      // ESC：游戏中/结算返回标题
+      if(k==='escape'&&this.state!==this.STATES.TITLE){
+        this.backToTitle();
+        return;
+      }
+      // Q：游戏中主动结束看成绩
+      if(k==='q'&&this.state===this.STATES.PLAYING){
+        this.endGame(true);
+        return;
+      }
+      if(this.state===this.STATES.TITLE){
+        if(k==='arrowup'||k==='arrowleft'||k==='w'||k==='a') this.titleSel=0;
+        else if(k==='arrowdown'||k==='arrowright'||k==='s'||k==='d') this.titleSel=1;
+        else if(k==='1') {this.titleSel=0;this.gameMode='timed';this.startCountdown();}
+        else if(k==='2') {this.titleSel=1;this.gameMode='endless';this.startCountdown();}
+        else if(k==='escape'){/* 标题界面ESC不处理 */}
+        else {this.gameMode=this.titleSel===0?'timed':'endless';this.startCountdown();}
+      }
+    });
+    window.addEventListener('keyup',e=>this.keys[e.key.toLowerCase()]=false);
+    this.cvs.addEventListener('mousedown',e=>{
+      // 游戏中点击右上角按钮
+      if(this.state===this.STATES.PLAYING||this.state===this.STATES.COUNTDOWN){
+        const cw=this.cvs.width;
+        // 返回按钮区域：右上角 (cw-110, 92) 大小 90x28
+        if(e.clientX>cw-110&&e.clientX<cw-20&&e.clientY>92&&e.clientY<120){
+          this.backToTitle();
+          return;
+        }
+        // 结束按钮区域：返回按钮下方 (cw-110, 126) 大小 90x28
+        if(e.clientX>cw-110&&e.clientX<cw-20&&e.clientY>126&&e.clientY<154){
+          this.endGame(true);
+          return;
+        }
+      }
+      this.mouseDown=true;
+      this.updateMouseDir(e);
+      if(this.state===this.STATES.TITLE){
+        const cw=this.cvs.width,ch=this.cvs.height;
+        const btnY=ch/2+140;
+        if(e.clientY<btnY){this.titleSel=0;}else{this.titleSel=1;}
+        this.gameMode=this.titleSel===0?'timed':'endless';
+        this.startCountdown();
+      }
+    });
+    this.cvs.addEventListener('mousemove',e=>{
+      if(this.mouseDown)this.updateMouseDir(e);
+    });
+    this.cvs.addEventListener('mouseup',()=>this.mouseDown=false);
+    // 结算画面点击
+    this.cvs.addEventListener('click',()=>{
+      if(this.state===this.STATES.SETTLEMENT)this.startCountdown();
+    });
+  }
+
+  updateMouseDir(e){
+    if(!this.player)return;
+    const cx=this.cvs.width/2, cy=this.cvs.height/2;
+    const dx=e.clientX-cx, dy=e.clientY-cy;
+    const len=Math.hypot(dx,dy);
+    if(len>5){this.mouseDir.x=dx/len;this.mouseDir.y=dy/len;}
+  }
+
+  startCountdown(){
+    if(!SFX.ctx)SFX.init();else SFX.resume();
+
+    this.state=this.STATES.COUNTDOWN;
+    this.countdownVal=3;
+    this.countdownTimer=0;
+    this.roundTimer=ROUND_TIME;
+    this.endlessTime=0;
+    this.comboCount=0;this.comboStart=0;this.comboLastEat=0;
+    this.maxCombo=0;this.objectsEaten=0;this.maxRadius=INIT_RADIUS;
+    this.growthHistory=[];this.settlementShown=false;
+    this.particles=[];this.shake=0;
+    this.items=[];       // 道具列表
+    this.itemTimer=15;   // 下次刷道具倒计时
+    this.activePowerups={};  // {speed, magnet, shield} 剩余秒数
+    this.wave=1;         // 无尽模式波次
+    this.waveTimer=20;   // 下次加波倒计时
+    this.endlessWin=false;  // 无尽模式是否达成胜利
+    this.endedManually=false;  // 是否手动结束
+    this.achievements_shown=this.achievements_shown||{};  // 本局已弹出的成就
+
+    this.world=new World();
+    this.player=new Hole(W/2,H/2,INIT_RADIUS,'#00ccff',false);
+    this.ais=[
+      new Hole(rand(200,W-200),rand(200,H-200),AI_INIT_RADIUS,'#ff4444','greedy'),
+      new Hole(rand(200,W-200),rand(200,H-200),AI_INIT_RADIUS,'#44ff44','wanderer'),
+      new Hole(rand(200,W-200),rand(200,H-200),AI_INIT_RADIUS,'#ff8844','hunter'),
+    ];
+  }
+
+  backToTitle(){
+    this.state=this.STATES.TITLE;
+    this.player=null;this.ais=[];this.world=null;
+    this.particles=[];this.items=[];
+  }
+
+  endGame(manual){
+    this.endedManually=!!manual;
+    this.state=this.STATES.SETTLEMENT;
+    SFX.gameover();
+  }
+
+  // ==================== 更新 ====================
+  update(dt){
+    this.time+=dt;
+    if(this.shake>0)this.shake=Math.max(0,this.shake-dt*60);
+    if(this.state===this.STATES.COUNTDOWN){
+      this.countdownTimer+=dt;
+      if(this.countdownTimer>=1){
+        this.countdownTimer=0;
+        this.countdownVal--;
+        SFX.countdown(this.countdownVal);
+        if(this.countdownVal<0)this.state=this.STATES.PLAYING;
+      }
+      return;
+    }
+    if(this.state!==this.STATES.PLAYING)return;
+
+    if(this.gameMode==='endless'){
+      this.endlessTime+=dt;
+
+      // 胜利判定：达到最高等级"城市杀手"
+      if(this.player.radius>=LEVELS[LEVELS.length-1][1]){
+        this.endlessWin=true;
+        this.state=this.STATES.SETTLEMENT;
+        SFX.gameover();
+        return;
+      }
+
+      // 难度递进：每20秒加一波，新AI体型随玩家水涨船高
+      this.waveTimer-=dt;
+      if(this.waveTimer<=0){
+        this.waveTimer=20;
+        this.wave++;
+        const types=['greedy','hunter','hunter'];  // 后期更多猎手
+        // 新AI在玩家附近生成，体型 = 玩家体型的 0.7~1.2 倍（总有能威胁玩家的）
+        const px=this.player.x, py=this.player.y;
+        const ang=rand(0,Math.PI*2), spawnDist=600;
+        const newR=Math.max(AI_INIT_RADIUS, this.player.radius*rand(0.7,1.2));
+        this.ais.push(new Hole(
+          clamp(px+Math.cos(ang)*spawnDist,200,W-200),
+          clamp(py+Math.sin(ang)*spawnDist,200,H-200),
+          newR,'#cc44ff',types[this.wave%3]
+        ));
+        // 控制AI总数上限，过多则移除最小的（保持性能+始终有威胁）
+        if(this.ais.length>8){
+          this.ais.sort((a,b)=>a.radius-b.radius);
+          this.ais.shift();
+        }
+        this.spawnParticles(px+Math.cos(ang)*spawnDist,py+Math.sin(ang)*spawnDist,'#cc44ff',20);
+      }
+    }else{
+      this.roundTimer-=dt;
+      if(this.roundTimer<=0){
+        this.roundTimer=0;
+        this.state=this.STATES.SETTLEMENT;
+        SFX.gameover();
+        return;
+      }
+    }
+
+    // 每秒记录成长曲线
+    const elapsed=this.gameMode==='endless'?this.endlessTime:ROUND_TIME-this.roundTimer;
+    if(this.growthHistory.length<300){
+      const sec=Math.floor(elapsed);
+      while(this.growthHistory.length<=sec){
+        this.growthHistory.push(this.player.radius);
+      }
+    }
+
+    this.updatePlayer(dt);
+    this.updateAIs(dt);
+    this.world.update(dt,this);
+    this.updateParticles();
+    this.updateItems(dt);
+    this.checkHoleVsHole();
+    this.checkAchievements();
+    // 成就提示衰减
+    if(this.achToast){this.achToast.timer-=dt;if(this.achToast.timer<=0)this.achToast=null;}
+  }
+
+  updatePlayer(dt){
+    const p=this.player;
+    if(p.invincible>0)p.invincible-=dt;
+
+    const speedMult=this.activePowerups&&this.activePowerups.speed?2:1;
+    const spd=calcSpeed(p.radius)*dt*speedMult;
+    let dx=0,dy=0;
+
+    // 键盘输入
+    if(this.keys['w']||this.keys['arrowup'])dy-=1;
+    if(this.keys['s']||this.keys['arrowdown'])dy+=1;
+    if(this.keys['a']||this.keys['arrowleft'])dx-=1;
+    if(this.keys['d']||this.keys['arrowright'])dx+=1;
+
+    // 鼠标输入（覆盖键盘）
+    if(this.mouseDown){
+      dx=this.mouseDir.x;
+      dy=this.mouseDir.y;
+    }
+
+    const len=Math.hypot(dx,dy);
+    if(len>0){
+      p.x+=dx/len*spd;
+      p.y+=dy/len*spd;
+    }
+
+    // 世界边界
+    p.x=clamp(p.x,p.radius,W-p.radius);
+    p.y=clamp(p.y,p.radius,H-p.radius);
+
+    this.maxRadius=Math.max(this.maxRadius,p.radius);
+  }
+
+  updateAIs(dt){
+    for(const ai of this.ais){
+      if(ai.invincible>0)ai.invincible-=dt;
+      ai.retargetTimer=(ai.retargetTimer||0)-dt;
+      if(ai.retargetTimer<=0){
+        ai.retargetTimer=AI_RETARGET;
+        this.aiRetarget(ai);
+      }
+
+      if(ai.targetX!=null){
+        const spd=calcSpeed(ai.radius)*AI_SPEED_MULT*dt;
+        const dx=ai.targetX-ai.x, dy=ai.targetY-ai.y;
+        const len=Math.hypot(dx,dy);
+        if(len>5){
+          ai.x+=dx/len*spd;
+          ai.y+=dy/len*spd;
+        }else{
+          ai.retargetTimer=0;
+        }
+      }else{
+        ai.retargetTimer=0;
+      }
+
+      ai.x=clamp(ai.x,ai.radius,W-ai.radius);
+      ai.y=clamp(ai.y,ai.radius,H-ai.radius);
+    }
+  }
+
+  aiRetarget(ai){
+    // === 攻击性：所有AI优先追击能吞噬的黑洞 ===
+    // hunter最凶（视野×2），greedy中等，wanderer较弱
+    const huntRange=ai.aiType==='hunter'?AI_VISION*2.2:
+                    ai.aiType==='greedy'?AI_VISION*1.5:AI_VISION;
+    const preyHoles=[this.player,...this.ais].filter(h=>h!==ai);
+    let preyTarget=null,preyScore=0;
+    for(const h of preyHoles){
+      if(h.invincible>0)continue;
+      // 能吞噬条件：自己半径 >= 对方×吞噬比例
+      if(ai.radius>=h.radius*EAT_RATIO){
+        const d=dist(ai,h);
+        if(d<huntRange){
+          // 越近、对方越大（猎物价值高）分数越高
+          const score=circleArea(h.radius)/(d+30);
+          if(score>preyScore){preyTarget=h;preyScore=score;}
+        }
+      }
+    }
+    if(preyTarget){
+      ai.targetX=preyTarget.x;ai.targetY=preyTarget.y;
+      ai.hunting=true;
+      return;
+    }
+    ai.hunting=false;
+
+    // === 躲避：附近有能吞掉自己的大黑洞则逃跑 ===
+    for(const h of preyHoles){
+      if(h.radius>=ai.radius*EAT_RATIO&&dist(ai,h)<AI_VISION){
+        // 朝反方向逃
+        const dx=ai.x-h.x,dy=ai.y-h.y,len=Math.hypot(dx,dy)||1;
+        ai.targetX=clamp(ai.x+dx/len*400,200,W-200);
+        ai.targetY=clamp(ai.y+dy/len*400,200,H-200);
+        return;
+      }
+    }
+
+    // === 觅食：追最大可吞噬物体 ===
+    const visionRange=ai.aiType==='wanderer'?AI_VISION*1.5:AI_VISION;
+    const nearby=this.world.getNearby(ai.x,ai.y,visionRange);
+    let best=null,bestScore=0;
+    for(const obj of nearby){
+      if(obj.absorbing||!obj.alive)continue;
+      if(ai.radius>=obj.radius){
+        const d=dist(ai,obj);
+        const score=circleArea(obj.radius)/(d+50);
+        if(score>bestScore){best=obj;bestScore=score;}
+      }
+    }
+    if(best){ai.targetX=best.x;ai.targetY=best.y;}
+    else{
+      ai.targetX=W/2+rand(-500,500);
+      ai.targetY=H/2+rand(-500,500);
+    }
+  }
+
+  checkHoleVsHole(){
+    const all=[this.player,...this.ais];
+    for(let i=0;i<all.length;i++){
+      for(let j=0;j<all.length;j++){
+        if(i===j)continue;
+        const a=all[i],b=all[j];
+        if(a.invincible>0||b.invincible>0)continue;
+        const d=dist(a,b);
+        if(d<a.radius&&a.radius>=b.radius*EAT_RATIO){
+          this.eatHole(a,b);
+        }
+      }
+    }
+  }
+
+  eatHole(eater,victim){
+    // 成长
+    const gained=circleArea(victim.radius)*GROWTH_EFF;
+    const newArea=circleArea(eater.radius)+gained;
+    eater.radius=radiusFromArea(newArea);
+
+    // 得分
+    const pts=Math.floor(circleArea(victim.radius)*2);
+    eater.score+=pts;
+    // 猎手成就：玩家吞掉AI
+    if(eater.isPlayer&&!victim.isPlayer) this.unlockAch('hunter','猎手');
+
+    // 重生受害者
+    victim.x=rand(200,W-200);
+    victim.y=rand(200,H-200);
+    victim.radius=victim.isPlayer?INIT_RADIUS:AI_INIT_RADIUS;
+    victim.invincible=INVINCIBLE_TIME;
+
+    // 玩家被吞惩罚
+    if(victim.isPlayer){
+      if(this.gameMode==='endless'){
+        // 无尽模式：玩家死亡=游戏结束
+        SFX.death();
+        this.state=this.STATES.SETTLEMENT;
+        SFX.gameover();
+        return;
+      }
+      victim.score=Math.floor(victim.score*(1-DEATH_PENALTY));
+      SFX.death();
+    }
+
+    // 粒子效果
+    this.spawnParticles(victim.x,victim.y,victim.color,15);
+  }
+
+  // ==================== 粒子 ====================
+  spawnParticles(x,y,color,count){
+    for(let i=0;i<count&&this.particles.length<MAX_PARTICLES;i++){
+      const angle=Math.random()*Math.PI*2;
+      const speed=rand(50,200);
+      this.particles.push({
+        x,y,
+        vx:Math.cos(angle)*speed,
+        vy:Math.sin(angle)*speed,
+        life:PARTICLE_LIFE,
+        maxLife:PARTICLE_LIFE,
+        color,
+        size:rand(2,5)
+      });
+    }
+  }
+
+  // 吸入粒子：带目标，会被黑洞加速吸入
+  spawnSuckParticles(x,y,tx,ty,color,count){
+    for(let i=0;i<count&&this.particles.length<MAX_PARTICLES;i++){
+      const angle=Math.random()*Math.PI*2;
+      const speed=rand(30,90);
+      this.particles.push({
+        x:x+Math.cos(angle)*rand(0,8),
+        y:y+Math.sin(angle)*rand(0,8),
+        vx:Math.cos(angle)*speed,
+        vy:Math.sin(angle)*speed,
+        tx,ty,                    // 吸引目标
+        life:PARTICLE_LIFE,
+        maxLife:PARTICLE_LIFE,
+        color,
+        size:rand(1.5,4)
+      });
+    }
+  }
+
+  updateParticles(){
+    for(let i=this.particles.length-1;i>=0;i--){
+      const p=this.particles[i];
+      // 有目标的粒子被加速吸向黑洞
+      if(p.tx!=null){
+        const dx=p.tx-p.x,dy=p.ty-p.y;
+        const d=Math.hypot(dx,dy)||1;
+        const pull=1200/(d+20);
+        p.vx+=dx/d*pull*(1/60);
+        p.vy+=dy/d*pull*(1/60);
+      }
+      p.x+=p.vx*(1/60);
+      p.y+=p.vy*(1/60);
+      p.life--;
+      if(p.life<=0)this.particles.splice(i,1);
+    }
+  }
+
+  // ==================== 成就系统 ====================
+  unlockAch(id,label){
+    if(this.unlockedAchievements[id])return;
+    this.unlockedAchievements[id]=true;
+    localStorage.setItem('cyberhole_ach',JSON.stringify(this.unlockedAchievements));
+    this.achToast={label:`🏆 ${label}`,timer:3.5};
+    SFX.combo(5);
+  }
+
+  checkAchievements(){
+    if(!this.player)return;
+    // 连击大师
+    if(this.maxCombo>=5) this.unlockAch('combo5','连击大师');
+    // 贪食黑洞
+    if(this.objectsEaten>=50) this.unlockAch('eat50','贪食黑洞');
+    // 城市终结者（最大半径超过大楼尺寸）
+    if(this.maxRadius>=120) this.unlockAch('bighole','城市终结者');
+    // 无尽模式生存3分钟
+    if(this.gameMode==='endless'&&this.endlessTime>=180) this.unlockAch('survive3','生存专家');
+  }
+
+  // ==================== 道具系统 ====================
+  // 道具类型：[type, color, symbol, label]
+  // speed=加速, magnet=磁铁, shield=护盾
+  static get ITEM_TYPES(){return[
+    {type:'speed', color:'#ffee00', label:'⚡ 加速'},
+    {type:'magnet',color:'#00ffff', label:'◎ 磁铁'},
+    {type:'shield',color:'#4488ff', label:'❖ 护盾'},
+  ];}
+
+  spawnItem(){
+    const t=Game.ITEM_TYPES[randInt(0,2)];
+    this.items.push({
+      x:rand(200,W-200), y:rand(200,H-200),
+      type:t.type, color:t.color, label:t.label,
+      r:18, pulse:0
+    });
+  }
+
+  updateItems(dt){
+    // 刷新道具
+    this.itemTimer-=dt;
+    if(this.itemTimer<=0&&this.items.length<3){
+      this.itemTimer=15;
+      this.spawnItem();
+    }
+
+    // 更新道具道具脉动
+    for(const item of this.items) item.pulse=(item.pulse||0)+dt;
+
+    // 道具拾取检测（仅玩家）
+    const p=this.player;
+    for(let i=this.items.length-1;i>=0;i--){
+      const item=this.items[i];
+      if(Math.hypot(p.x-item.x,p.y-item.y)<p.radius+item.r){
+        this.activePowerups[item.type]=item.type==='speed'?10:item.type==='magnet'?5:3;
+        this.items.splice(i,1);
+        this.spawnParticles(item.x,item.y,item.color,12);
+        SFX.combo(3);
+        if(item.type==='shield') p.invincible=3;
+      }
+    }
+
+    // 道具效果衰减
+    for(const k of Object.keys(this.activePowerups)){
+      this.activePowerups[k]-=dt;
+      if(this.activePowerups[k]<=0) delete this.activePowerups[k];
+    }
+
+    // 磁铁效果：扩大吸附范围（在 tryAbsorb 里读取）
+    // 加速效果：在 updatePlayer 里读取
+  }
+
+  // ==================== 吞噬处理 ====================
+  tryAbsorb(hole){
+    const magnetMult=hole.isPlayer&&this.activePowerups&&this.activePowerups.magnet?2.5:1;
+    const absorbR=hole.radius*magnetMult;
+    const nearby=this.world.getNearby(hole.x,hole.y,absorbR+80);
+    for(const obj of nearby){
+      if(obj.absorbing)continue;
+      if(hole.radius<obj.radius)continue;
+      const d=Math.hypot(hole.x-obj.x,hole.y-obj.y);
+      if(d>absorbR)continue;
+
+      // 吞噬!
+      obj.absorbing=true;
+      obj.absorbTimer=ABSORB_ANIM;
+      obj.absorbX=hole.x;
+      obj.absorbY=hole.y;
+
+      // 成长
+      const gained=circleArea(obj.radius)*GROWTH_EFF;
+      const newArea=circleArea(hole.radius)+gained;
+      hole.radius=radiusFromArea(newArea);
+
+      // 计分（仅玩家）
+      if(hole.isPlayer){
+        this.objectsEaten++;
+        const basePts=Math.floor(circleArea(obj.radius)/100);
+
+        // 连击
+        const now=this.roundTimer?ROUND_TIME-this.roundTimer:0;
+        if(this.comboCount===0){
+          this.comboStart=now;
+          this.comboCount=1;
+        }else if(now-this.comboLastEat>COMBO_WINDOW){
+          // 超时，重置
+          this.comboCount=1;
+          this.comboStart=now;
+        }else{
+          this.comboCount++;
+        }
+        this.comboLastEat=now;
+
+        // 3秒绝对上限
+        if(now-this.comboStart>COMBO_ABS_CAP){
+          this.comboCount=0;
+          this.comboStart=0;
+        }
+
+        let mult=1;
+        if(this.comboCount>=5)mult=3;
+        else if(this.comboCount>=4)mult=2;
+        else if(this.comboCount>=3)mult=1.5;
+
+        hole.score+=Math.floor(basePts*mult);
+        this.maxCombo=Math.max(this.maxCombo,this.comboCount);
+
+        // 音效
+        SFX.eat(obj.radius,hole.radius);
+        if(this.comboCount>=3)SFX.combo(this.comboCount);
+      }
+
+      // 屏幕震动：大物体吞噬时抖一下（仅玩家视角，按物体大小缩放）
+      if(hole.isPlayer){
+        this.shake=Math.min(14,this.shake+clamp(obj.radius/8,0.5,14));
+      }
+
+      // 吸入粒子：朝黑洞中心飞的霓虹碎片
+      this.spawnSuckParticles(obj.x,obj.y,hole.x,hole.y,obj.color,10);
+    }
+  }
+
+  // ==================== 渲染 ====================
+  draw(){
+    const ctx=this.ctx;
+    const cw=this.cvs.width, ch=this.cvs.height;
+    ctx.fillStyle='#0a0a12';
+    ctx.fillRect(0,0,cw,ch);
+
+    if(this.state===this.STATES.TITLE){
+      this.drawTitle();return;
+    }
+    if(this.state===this.STATES.COUNTDOWN){
+      this.drawWorld();
+      this.drawCountdown();return;
+    }
+    if(this.state===this.STATES.SETTLEMENT){
+      this.drawSettlement();return;
+    }
+
+    // PLAYING
+    this.drawWorld();
+    this.drawHUD();
+  }
+
+  drawTitle(){
+    const ctx=this.ctx;
+    const cw=this.cvs.width,ch=this.cvs.height;
+    const t=this.time;
+
+    // 背景
+    ctx.fillStyle='#0a0a14';
+    ctx.fillRect(0,0,cw,ch);
+
+    // 透视网格（从底部向上的消失点效果）
+    ctx.strokeStyle='#141428';ctx.lineWidth=1;
+    const vanishX=cw/2,vanishY=ch*0.35;
+    for(let i=0;i<=20;i++){
+      const x=i/20*cw;
+      ctx.beginPath();ctx.moveTo(x,ch);ctx.lineTo(vanishX,vanishY);ctx.stroke();
+    }
+    for(let i=1;i<=12;i++){
+      const p=i/12;
+      const y=ch-(ch-vanishY)*p*p;
+      ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(cw,y);ctx.stroke();
+    }
+
+    // 浮动粒子（标题页专用，不存 particles 数组，纯数学计算）
+    ctx.fillStyle='#00ccff';
+    for(let i=0;i<25;i++){
+      const seed=i*137.5;
+      const px=(Math.sin(seed)*0.5+0.5)*cw;
+      const py=((t*30+seed*3)%(ch+40))-20;
+      const alpha=0.15+Math.sin(t*2+seed)*0.1;
+      ctx.globalAlpha=alpha;
+      ctx.beginPath();ctx.arc(px,py,1.5+Math.sin(seed)*1,0,Math.PI*2);ctx.fill();
+    }
+    ctx.globalAlpha=1;
+
+    // 中央黑洞（装饰性，呼吸脉动）
+    const cx=cw/2,cy=ch/2-20;
+    const br=60+Math.sin(t*1.5)*5;
+    // 外圈辉光
+    ctx.beginPath();ctx.arc(cx,cy,br*1.4,0,Math.PI*2);
+    ctx.strokeStyle='#00ccff';ctx.lineWidth=3;ctx.globalAlpha=0.15;ctx.stroke();
+    ctx.globalAlpha=1;
+    // 黑洞
+    ctx.beginPath();ctx.arc(cx,cy,br,0,Math.PI*2);
+    ctx.fillStyle='#000';ctx.fill();
+    // 霓虹环
+    ctx.beginPath();ctx.arc(cx,cy,br,0,Math.PI*2);
+    ctx.strokeStyle='#00ccff';ctx.lineWidth=2.5;ctx.stroke();
+    // 旋转弧
+    ctx.strokeStyle='#00ccff';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(cx,cy,br*0.75,t*2,t*2+Math.PI*1.1);ctx.globalAlpha=0.5;ctx.stroke();
+    ctx.beginPath();ctx.arc(cx,cy,br*0.75,t*2+Math.PI,t*2+Math.PI+Math.PI*0.8);ctx.stroke();
+    ctx.globalAlpha=1;
+    // 奇点
+    const coreR=4+Math.sin(t*6)*1.5;
+    ctx.beginPath();ctx.arc(cx,cy,coreR,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();
+
+    // 标题文字（在黑洞上方）
+    ctx.fillStyle='#fff';
+    ctx.font='bold 64px monospace';
+    ctx.textAlign='center';
+    ctx.fillText('CYBERHOLE',cx,cy-br-30);
+
+    // 副标题
+    ctx.fillStyle='#ff00cc';
+    ctx.font='18px monospace';
+    ctx.fillText('赛博朋克黑洞入侵',cx,cy+br+35);
+
+    // 模式选择按钮
+    const modes=[{label:'限时赛',desc:'2分钟限时竞速'},{label:'无尽模式',desc:'撑到最后'}];
+    const btnW=160,btnH=44,gap=20;
+    const btnStartX=cx-(btnW*2+gap)/2;
+    for(let i=0;i<2;i++){
+      const bx=btnStartX+i*(btnW+gap),by=cy+br+60;
+      const sel=this.titleSel===i;
+      ctx.fillStyle=sel?'rgba(0,204,255,0.15)':'rgba(255,255,255,0.05)';
+      ctx.fillRect(bx,by,btnW,btnH);
+      ctx.strokeStyle=sel?'#00ccff':'#444';
+      ctx.lineWidth=sel?2:1;
+      ctx.strokeRect(bx,by,btnW,btnH);
+      ctx.fillStyle=sel?'#00ccff':'#888';
+      ctx.font=`bold ${sel?16:14}px monospace`;
+      ctx.fillText(modes[i].label,bx+btnW/2,by+16);
+      ctx.fillStyle=sel?'#aaa':'#555';
+      ctx.font='11px monospace';
+      ctx.fillText(modes[i].desc,bx+btnW/2,by+32);
+    }
+
+    // 提示
+    const blink=Math.sin(t*3)*0.3+0.7;
+    ctx.globalAlpha=blink;
+    ctx.fillStyle='#88ccff';ctx.font='14px monospace';
+    ctx.fillText('← → 选择模式  Enter/任意键 开始',cx,cy+br+122);
+    ctx.globalAlpha=1;
+
+    // 操控提示
+    ctx.fillStyle='#444';ctx.font='12px monospace';
+    ctx.fillText('WASD / 方向键 / 鼠标拖拽 移动',cx,cy+br+145);
+  }
+
+  drawCountdown(){
+    const ctx=this.ctx;
+    const cw=this.cvs.width,ch=this.cvs.height;
+    ctx.fillStyle='rgba(0,0,0,0.6)';
+    ctx.fillRect(0,0,cw,ch);
+    ctx.save();
+    ctx.shadowColor='#00ccff';ctx.shadowBlur=20;
+    ctx.fillStyle='#00ccff';
+    ctx.font='bold 120px monospace';
+    ctx.textAlign='center';
+    ctx.textBaseline='middle';
+    ctx.fillText(this.countdownVal>0?this.countdownVal:'GO!',cw/2,ch/2);
+    ctx.restore();
+  }
+
+  drawWorld(){
+    const ctx=this.ctx;
+    const cw=this.cvs.width,ch=this.cvs.height;
+    const p=this.player;
+    if(!p)return;
+
+    const zoom=calcZoom(p.radius);
+    const camX=p.x-cw/(2*zoom);
+    const camY=p.y-ch/(2*zoom);
+
+    // 屏幕震动：吞噬大物体时的位移抖动
+    let sx=0,sy=0;
+    if(this.shake>0){
+      sx=rand(-this.shake,this.shake);
+      sy=rand(-this.shake,this.shake);
+    }
+
+    ctx.save();
+    ctx.translate(sx,sy);
+    ctx.scale(zoom,zoom);
+    ctx.translate(-camX,-camY);
+
+    // 世界背景
+    ctx.fillStyle='#0d0d1a';
+    ctx.fillRect(camX,camY,cw/zoom,ch/zoom);
+
+    // 网格线：只画视口内可见的，不画整个世界
+    ctx.strokeStyle='#1a1a2e';ctx.lineWidth=1;
+    const gx0=Math.floor(camX/200)*200,gx1=Math.ceil((camX+cw/zoom)/200)*200;
+    const gy0=Math.floor(camY/200)*200,gy1=Math.ceil((camY+ch/zoom)/200)*200;
+    for(let x=gx0;x<=gx1;x+=200){ctx.beginPath();ctx.moveTo(x,gy0);ctx.lineTo(x,gy1);ctx.stroke();}
+    for(let y=gy0;y<=gy1;y+=200){ctx.beginPath();ctx.moveTo(gx0,y);ctx.lineTo(gx1,y);ctx.stroke();}
+
+    // 世界边界警告
+    const edgeDist=200;
+    ctx.strokeStyle='rgba(255,0,0,0.3)';ctx.lineWidth=3/zoom;ctx.setLineDash([10/zoom,10/zoom]);
+    ctx.strokeRect(edgeDist,edgeDist,W-edgeDist*2,H-edgeDist*2);
+    ctx.setLineDash([]);
+
+    // 视口裁剪绘制物体
+    const viewL=camX-100,viewR=camX+cw/zoom+100;
+    const viewT=camY-100,viewB=camY+ch/zoom+100;
+    this.world.draw(ctx,viewL,viewR,viewT,viewB,p);
+
+    // 绘制道具
+    for(const item of(this.items||[])){
+      const pulse=Math.sin(item.pulse*4)*3;
+      ctx.save();
+      ctx.translate(item.x,item.y);
+      // 外圈脉动
+      ctx.beginPath();ctx.arc(0,0,item.r+pulse+4,0,Math.PI*2);
+      ctx.strokeStyle=item.color;ctx.lineWidth=1.5;ctx.globalAlpha=0.4;ctx.stroke();
+      // 主体
+      ctx.globalAlpha=1;
+      ctx.beginPath();ctx.arc(0,0,item.r,0,Math.PI*2);
+      ctx.fillStyle='rgba(0,0,0,0.7)';ctx.fill();
+      ctx.strokeStyle=item.color;ctx.lineWidth=2;ctx.stroke();
+      // 标签
+      ctx.fillStyle=item.color;
+      ctx.font='bold 11px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText(item.label,0,0);
+      ctx.restore();
+    }
+
+    // 绘制粒子
+    for(const pt of this.particles){
+      const alpha=pt.life/pt.maxLife;
+      ctx.globalAlpha=alpha;
+      ctx.fillStyle=pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x,pt.y,pt.size,0,Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha=1;
+
+    // 绘制黑洞（玩家全特效，AI 简化版省性能）
+    this.drawOrbitParticles(ctx,p);
+    this.drawHole(ctx,p,true);
+    for(const ai of this.ais)this.drawHole(ctx,ai,false);
+
+    ctx.restore();
+  }
+
+  // 黑洞吸附粒子：环绕玩家黑洞轨道旋转的霓虹光点
+  drawOrbitParticles(ctx,hole){
+    const lvl=getLevel(hole.radius);
+    const color=LEVELS[lvl][3];
+    const R=hole.radius;
+    const count=6;
+    ctx.save();
+    ctx.fillStyle=color;
+    for(let i=0;i<count;i++){
+      const a=this.time*1.8+i*(Math.PI*2/count);
+      // 轨道半径随时间略微脉动，营造被吸入感
+      const orbit=R*(1.3+Math.sin(this.time*2+i)*0.15);
+      const px=hole.x+Math.cos(a)*orbit;
+      const py=hole.y+Math.sin(a)*orbit;
+      ctx.globalAlpha=0.6+Math.sin(this.time*4+i)*0.3;
+      ctx.beginPath();ctx.arc(px,py,Math.max(1.5,R*0.06),0,Math.PI*2);ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  drawHole(ctx,hole,fancy){
+    // 无敌闪烁
+    if(hole.invincible>0&&Math.floor(hole.invincible*10)%2===0)return;
+
+    const lvl=getLevel(hole.radius);
+    const glowColor=LEVELS[lvl][3];
+    const R=hole.radius;
+
+    ctx.save();
+    ctx.translate(hole.x,hole.y);
+
+    // AI 黑洞：简化版，无渐变无辉光，省性能
+    if(!fancy){
+      // 正在追击玩家时描边变红闪烁（危险预警）
+      const huntingPlayer=hole.hunting&&this.player&&hole.radius>=this.player.radius*EAT_RATIO
+        &&dist(hole,this.player)<AI_VISION*2;
+      const ringColor=huntingPlayer&&Math.floor(this.time*8)%2===0?'#ff2222':glowColor;
+      ctx.beginPath();ctx.arc(0,0,R,0,Math.PI*2);
+      ctx.fillStyle='#000';ctx.fill();
+      ctx.strokeStyle=ringColor;ctx.lineWidth=Math.max(1,R*0.05);ctx.stroke();
+      ctx.beginPath();ctx.arc(0,0,Math.max(2,R*0.15),0,Math.PI*2);
+      ctx.fillStyle=ringColor;ctx.fill();
+      ctx.restore();
+      return;
+    }
+
+    // === 以下仅玩家黑洞：零 shadowBlur 版 ===
+    const t=this.time;
+
+    // 连击脉冲
+    let pulse=0;
+    if(this.comboCount>=3){
+      pulse=Math.sin(t*12)*0.1+0.1;
+    }
+
+    // 外圈辉光：粗半透明圆 + 细实线（替代 gradient+shadowBlur）
+    ctx.beginPath();ctx.arc(0,0,R*(1.1+pulse),0,Math.PI*2);
+    ctx.strokeStyle=glowColor;ctx.lineWidth=Math.max(2,R*0.12);ctx.globalAlpha=0.25;ctx.stroke();
+    ctx.globalAlpha=1;
+
+    // 黑洞实心
+    ctx.beginPath();ctx.arc(0,0,R,0,Math.PI*2);
+    ctx.fillStyle='#000';ctx.fill();
+
+    // 霓虹环
+    ctx.beginPath();ctx.arc(0,0,R,0,Math.PI*2);
+    ctx.strokeStyle=glowColor;ctx.lineWidth=Math.max(2,R*0.06);ctx.stroke();
+
+    // 旋转弧（2条，双描边）
+    for(let i=0;i<2;i++){
+      const a=t*(2.5-i*0.8)+i*Math.PI;
+      ctx.beginPath();ctx.arc(0,0,R*(0.8-i*0.15),a,a+Math.PI*1.2);
+      ctx.strokeStyle=glowColor;ctx.lineWidth=Math.max(1,R*0.08);ctx.globalAlpha=0.5-i*0.15;ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+
+    // 奇点
+    const core=Math.max(2,R*0.12)*(1+Math.sin(t*8)*0.25);
+    ctx.beginPath();ctx.arc(0,0,core,0,Math.PI*2);
+    ctx.fillStyle='#fff';ctx.fill();
+
+    ctx.restore();
+  }
+
+  drawHUD(){
+    const ctx=this.ctx;
+    const cw=this.cvs.width;
+
+    // 倒计时
+    const mins=Math.floor(this.roundTimer/60);
+    const secs=Math.floor(this.roundTimer%60);
+    ctx.fillStyle='#00ccff';
+    ctx.font='bold 28px monospace';
+    ctx.textAlign='center';
+    ctx.fillText(`${mins}:${secs.toString().padStart(2,'0')}`,cw/2,40);
+
+    // 分数
+    ctx.fillStyle='#fff';
+    ctx.font='20px monospace';
+    ctx.textAlign='left';
+    ctx.fillText(`分数: ${this.player.score}`,20,35);
+
+    // 层级
+    const lvl=getLevel(this.player.radius);
+    const lvlName=LEVELS[lvl][0];
+    ctx.fillStyle=LEVELS[lvl][3];
+    ctx.fillText(`Lv${lvl+1} ${lvlName}`,20,60);
+
+    // 成长进度条
+    const barW=200,barH=8;
+    const barX=20,barY=70;
+    const nextR=LEVELS[lvl][2];
+    const prevR=LEVELS[lvl][1];
+    const range=nextR-prevR;
+    const progress=range===Infinity?1:clamp((this.player.radius-prevR)/range,0,1);
+    ctx.fillStyle='#222';
+    ctx.fillRect(barX,barY,barW,barH);
+    ctx.fillStyle=LEVELS[lvl][3];
+    ctx.fillRect(barX,barY,barW*progress,barH);
+
+    // 连击
+    if(this.comboCount>=3){
+      const mult=this.comboCount>=5?3:this.comboCount>=4?2:1.5;
+      ctx.fillStyle='#ff00cc';
+      ctx.font='bold 24px monospace';
+      ctx.textAlign='right';
+      ctx.fillText(`×${mult} COMBO!`,cw-20,40);
+    }
+
+    // 半径
+    ctx.fillStyle='#666';
+    ctx.font='13px monospace';
+    ctx.textAlign='right';
+    ctx.fillText(`R: ${this.player.radius.toFixed(1)}`,cw-20,60);
+
+    // FPS 计数器
+    ctx.fillStyle=this.fps>=50?'#4f4':this.fps>=30?'#ff4':'#f44';
+    ctx.font='bold 16px monospace';
+    ctx.fillText(`${this.fps} FPS`,cw-20,80);
+
+    // 返回按钮（右上角，FPS下方）
+    const rbX=cw-110,rbY=92,rbW=90,rbH=28;
+    ctx.fillStyle='rgba(255,255,255,0.08)';
+    ctx.fillRect(rbX,rbY,rbW,rbH);
+    ctx.strokeStyle='#888';ctx.lineWidth=1;
+    ctx.strokeRect(rbX,rbY,rbW,rbH);
+    ctx.fillStyle='#aaa';ctx.font='13px monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('← ESC返回',rbX+rbW/2,rbY+rbH/2);
+
+    // 结束按钮（返回按钮下方）
+    const ebY=rbY+rbH+6;
+    ctx.fillStyle='rgba(255,204,0,0.1)';
+    ctx.fillRect(rbX,ebY,rbW,rbH);
+    ctx.strokeStyle='#ffcc00';ctx.lineWidth=1;
+    ctx.strokeRect(rbX,ebY,rbW,rbH);
+    ctx.fillStyle='#ffcc00';ctx.font='13px monospace';
+    ctx.fillText('Q 结束看成绩',rbX+rbW/2,ebY+rbH/2);
+    ctx.textBaseline='alphabetic';
+
+    // 激活道具状态
+    const pw=this.activePowerups||{};
+    const pwList=[
+      pw.speed&&{label:`⚡ ${pw.speed.toFixed(1)}s`,color:'#ffee00'},
+      pw.magnet&&{label:`◎ ${pw.magnet.toFixed(1)}s`,color:'#00ffff'},
+      pw.shield&&{label:`❖ ${pw.shield.toFixed(1)}s`,color:'#4488ff'},
+    ].filter(Boolean);
+    ctx.textAlign='left';ctx.font='bold 14px monospace';
+    for(let i=0;i<pwList.length;i++){
+      ctx.fillStyle=pwList[i].color;
+      ctx.fillText(pwList[i].label,20,100+i*22);
+    }
+
+    // 无尽模式：显示波次+存活时间
+    if(this.gameMode==='endless'){
+      const m=Math.floor(this.endlessTime/60),s=Math.floor(this.endlessTime%60);
+      ctx.fillStyle='#cc44ff';ctx.font='bold 18px monospace';
+      ctx.textAlign='left';
+      ctx.fillText(`波次 ${this.wave}`,20,180);
+      ctx.fillStyle='#aaa';ctx.font='16px monospace';
+      ctx.fillText(`${m}:${String(s).padStart(2,'0')}`,20,200);
+    }
+
+    // 成就弹出条（从屏幕顶部滑入）
+    if(this.achToast){
+      const t=this.achToast.timer;
+      const slideIn=t>3?1-(t-3)/0.5:t<0.5?t/0.5:1; // 0.5s滑入，0.5s淡出
+      ctx.save();
+      ctx.globalAlpha=Math.min(1,slideIn);
+      const bw=280,bh=40,bx=cw/2-bw/2,by=10-40*(1-slideIn);
+      ctx.fillStyle='rgba(0,0,0,0.8)';
+      ctx.fillRect(bx,by,bw,bh);
+      ctx.strokeStyle='#ffcc00';ctx.lineWidth=1.5;ctx.strokeRect(bx,by,bw,bh);
+      ctx.fillStyle='#ffcc00';ctx.font='bold 15px monospace';
+      ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText(this.achToast.label,cw/2,by+bh/2);
+      ctx.restore();
+    }
+
+    // Minimap
+    const ch=this.cvs.height;
+    const mmSize=150,mmX=cw-mmSize-15,mmY=ch-mmSize-15;
+    const mmScale=mmSize/W;
+    ctx.fillStyle='rgba(0,0,0,0.6)';
+    ctx.fillRect(mmX,mmY,mmSize,mmSize);
+    ctx.strokeStyle='#333';ctx.lineWidth=1;
+    ctx.strokeRect(mmX,mmY,mmSize,mmSize);
+    // Objects on minimap
+    for(const obj of this.world.objects){
+      if(!obj.alive&&!obj.absorbing)continue;
+      const mx=mmX+obj.x*mmScale,my=mmY+obj.y*mmScale;
+      ctx.fillStyle=obj.color;
+      ctx.fillRect(mx-1,my-1,2,2);
+    }
+    // AI on minimap
+    for(const ai of this.ais){
+      const mx=mmX+ai.x*mmScale,my=mmY+ai.y*mmScale;
+      ctx.fillStyle=ai.color;
+      ctx.beginPath();ctx.arc(mx,my,3,0,Math.PI*2);ctx.fill();
+    }
+    // Player on minimap
+    const px=mmX+this.player.x*mmScale,py=mmY+this.player.y*mmScale;
+    ctx.fillStyle='#00ccff';
+    ctx.beginPath();ctx.arc(px,py,4,0,Math.PI*2);ctx.fill();
+  }
+
+  drawSettlement(){
+    const ctx=this.ctx;
+    const cw=this.cvs.width,ch=this.cvs.height;
+    const t=this.time;
+
+    ctx.fillStyle='#0a0a14';
+    ctx.fillRect(0,0,cw,ch);
+
+    const endless=this.gameMode==='endless';
+    // 排名
+    const all=[this.player,...this.ais].sort((a,b)=>b.score-a.score);
+    const rank=all.indexOf(this.player)+1;
+    const rankBonus=rank===1?1000:rank===2?500:200;
+    // 胜利：限时赛=第1名；无尽=达到最高级
+    const isWin=endless?this.endlessWin:rank===1;
+
+    // 标题
+    ctx.textAlign='center';
+    ctx.font='bold 44px monospace';
+    ctx.fillStyle=isWin?'#ffcc00':'#00ccff';
+    let titleText='游戏结束';
+    if(isWin)titleText='VICTORY';
+    else if(endless&&this.endedManually)titleText='本局结束';
+    else if(endless)titleText='你被吞噬了';
+    ctx.fillText(titleText,cw/2,70);
+
+    // 徽章
+    if(isWin){
+      ctx.save();
+      ctx.strokeStyle='#ffcc00';ctx.lineWidth=3;
+      ctx.beginPath();ctx.arc(cw/2,130,35,0,Math.PI*2);ctx.stroke();
+      ctx.font='bold 22px monospace';ctx.fillStyle='#ffcc00';
+      ctx.fillText(endless?'MAX':'#1',cw/2,138);
+      ctx.restore();
+    }else if(!endless){
+      ctx.font='bold 24px monospace';ctx.fillStyle='#888';
+      ctx.fillText(`第${rank}名`,cw/2,135);
+    }
+
+    // 主数字：限时赛=总分，无尽=存活时长
+    if(endless){
+      const m=Math.floor(this.endlessTime/60),s=Math.floor(this.endlessTime%60);
+      ctx.font='bold 52px monospace';ctx.fillStyle='#fff';
+      ctx.fillText(`${m}:${String(s).padStart(2,'0')}`,cw/2,210);
+      ctx.font='16px monospace';ctx.fillStyle='#888';
+      ctx.fillText('存活时长',cw/2,232);
+    }else{
+      ctx.font='bold 56px monospace';ctx.fillStyle='#fff';
+      const totalScore=this.player.score+rankBonus+500;
+      ctx.fillText(totalScore,cw/2,210);
+      ctx.font='16px monospace';ctx.fillStyle='#888';
+      ctx.fillText('TOTAL SCORE',cw/2,232);
+    }
+
+    // 统计行
+    const stats=endless?[
+      ['到达波次',`${this.wave}`,'#cc44ff'],
+      ['吞噬数',`${this.objectsEaten}`,'#44ff88'],
+      ['最大半径',`${this.maxRadius.toFixed(1)}`,'#ff8844'],
+      ['最高连击',`${this.maxCombo}`,'#ff00cc'],
+      ['得分',`${this.player.score}`,'#00ccff'],
+    ]:[
+      ['吞噬数',`${this.objectsEaten}`,'#44ff88'],
+      ['最大半径',`${this.maxRadius.toFixed(1)}`,'#ff8844'],
+      ['最高连击',`${this.maxCombo}`,'#ff00cc'],
+      ['排名奖',`+${rankBonus}`,'#ffcc00'],
+      ['存活奖','+500','#00ccff'],
+    ];
+    const sy=270;
+    ctx.font='18px monospace';
+    for(let i=0;i<stats.length;i++){
+      const [label,val,color]=stats[i];
+      const y=sy+i*34;
+      ctx.fillStyle='#888';ctx.textAlign='right';
+      ctx.fillText(label,cw/2-15,y);
+      ctx.fillStyle=color;ctx.textAlign='left';
+      ctx.fillText(val,cw/2+15,y);
+    }
+
+    // 排行榜（仅限时赛）
+    if(!endless){
+      ctx.textAlign='center';
+      ctx.fillStyle='#555';ctx.font='14px monospace';
+      ctx.fillText('─ 排行榜 ─',cw/2,sy+stats.length*34+25);
+      const lbY=sy+stats.length*34+50;
+      ctx.font='15px monospace';
+      for(let i=0;i<all.length;i++){
+        const h=all[i];
+        const isMe=h===this.player;
+        ctx.fillStyle=isMe?'#fff':'#666';
+        ctx.fillText(`${i+1}. ${isMe?'YOU':'AI'}  ${h.score}`,cw/2,lbY+i*24);
+      }
+    }
+
+    // 成长曲线
+    if(this.growthHistory.length>1){
+      const gx=cw/2-180,gy=ch-120,gw=360,gh=80;
+      ctx.strokeStyle='#222';ctx.lineWidth=1;
+      ctx.strokeRect(gx,gy,gw,gh);
+      ctx.fillStyle='#444';ctx.font='11px monospace';ctx.textAlign='center';
+      ctx.fillText('成长曲线',gx+gw/2,gy-6);
+      const maxR=Math.max(...this.growthHistory,1);
+      ctx.strokeStyle='#00ccff';ctx.lineWidth=2;
+      ctx.beginPath();
+      for(let i=0;i<this.growthHistory.length;i++){
+        const x=gx+i/this.growthHistory.length*gw;
+        const y=gy+gh-this.growthHistory[i]/maxR*gh;
+        i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    }
+
+    // 再来一局（呼吸闪烁）
+    const blink=Math.sin(t*3)*0.3+0.7;
+    ctx.globalAlpha=blink;
+    ctx.fillStyle=isWin?'#ffcc00':'#00ccff';
+    ctx.font='bold 18px monospace';
+    ctx.textAlign='center';
+    ctx.fillText('点击再来一局',cw/2,ch-25);
+    ctx.globalAlpha=1;
+  }
+
+  // ==================== 主循环 ====================
+  start(){
+    const loop=(now)=>{
+      let dt=(now-this.lastT)/1000;
+      this.lastT=now;
+      if(dt>0.1)dt=0.016;
+
+      // FPS 计数
+      this._fpsN++;
+      if(now-this._fpsT>=1000){
+        this.fps=this._fpsN;
+        this._fpsN=0;
+        this._fpsT=now;
+      }
+
+      this.update(dt);
+      this.draw();
+      requestAnimationFrame(loop);
+    };
+    this.lastT=performance.now();
+    this._fpsT=performance.now();
+    requestAnimationFrame(loop);
+  }
+}
+
+// ==================== Class: Hole ====================
+class Hole{
+  constructor(x,y,radius,color,isPlayerOrType){
+    this.x=x;this.y=y;
+    this.radius=radius;
+    this.color=color;
+    this.score=0;
+    this.invincible=0;
+    this.isPlayer=isPlayerOrType===false;
+    this.aiType=(!this.isPlayer&&typeof isPlayerOrType==='string')?isPlayerOrType:null;
+    this.targetX=null;this.targetY=null;
+    this.retargetTimer=0;
+  }
+}
+
+// ==================== Class: World ====================
+class World{
+  constructor(){
+    this.objects=[];
+    this.grid={};  // 空间哈希: "cx,cy" -> [obj,...]
+
+    // 生成物体
+    for(const[name,radius,color,count] of OBJ_TYPES){
+      for(let i=0;i<count;i++){
+        this.addObject(rand(100,W-100),rand(100,H-100),radius,color,name);
+      }
+    }
+
+    // 保证出生点附近有足够的小物体
+    const startZone=400;
+    for(let i=0;i<20;i++){
+      this.addObject(W/2+rand(-startZone,startZone),H/2+rand(-startZone,startZone),6,'#888888','路标');
+    }
+    for(let i=0;i<10;i++){
+      this.addObject(W/2+rand(-startZone,startZone),H/2+rand(-startZone,startZone),10,'#00ffcc','广告牌');
+    }
+  }
+
+  addObject(x,y,radius,color,name){
+    const obj={x,y,radius,color,name,absorbing:false,absorbTimer:0,absorbX:0,absorbY:0,respawnTimer:0,alive:true};
+    this.objects.push(obj);
+    this.addToGrid(obj);
+    return obj;
+  }
+
+  addToGrid(obj){
+    const cx=Math.floor(obj.x/CELL),cy=Math.floor(obj.y/CELL);
+    const key=`${cx},${cy}`;
+    if(!this.grid[key])this.grid[key]=[];
+    this.grid[key].push(obj);
+  }
+
+  removeFromGrid(obj){
+    const cx=Math.floor(obj.x/CELL),cy=Math.floor(obj.y/CELL);
+    const key=`${cx},${cy}`;
+    if(this.grid[key]){
+      const idx=this.grid[key].indexOf(obj);
+      if(idx>=0)this.grid[key].splice(idx,1);
+    }
+  }
+
+  getNearby(x,y,range){
+    const result=[];
+    const cr=Math.ceil(range/CELL);
+    const cx=Math.floor(x/CELL),cy=Math.floor(y/CELL);
+    for(let dx=-cr;dx<=cr;dx++){
+      for(let dy=-cr;dy<=cr;dy++){
+        const key=`${cx+dx},${cy+dy}`;
+        if(this.grid[key])result.push(...this.grid[key]);
+      }
+    }
+    return result;
+  }
+
+  update(dt,game){
+    const player=game.player;
+    const allHoles=[player,...game.ais];
+
+    for(const hole of allHoles){
+      game.tryAbsorb(hole);
+    }
+
+    // 更新吞噬动画和重生
+    for(let i=this.objects.length-1;i>=0;i--){
+      const obj=this.objects[i];
+
+      if(obj.absorbing){
+        obj.absorbTimer-=dt;
+        // 动画：缩小+移向目标
+        const t=1-obj.absorbTimer/ABSORB_ANIM;
+        obj.scale=1-t;
+        if(obj.absorbTimer<=0){
+          obj.absorbing=false;
+          obj.alive=false;
+          obj.respawnTimer=RESPAWN_DELAY;
+          this.removeFromGrid(obj);
+        }
+      }
+
+      if(!obj.alive&&!obj.absorbing){
+        obj.respawnTimer-=dt;
+        if(obj.respawnTimer<=0){
+          // 重生（淡入动画）
+          this.removeFromGrid(obj);
+          obj.x=rand(100,W-100);
+          obj.y=rand(100,H-100);
+          obj.alive=true;
+          obj.scale=0;          // 从 0 开始淡入
+          obj.spawning=0.4;     // 淡入持续 0.4 秒
+          this.addToGrid(obj);
+        }
+      }
+
+      // 重生淡入动画
+      if(obj.alive&&obj.spawning>0){
+        obj.spawning-=dt;
+        obj.scale=1-Math.max(0,obj.spawning)/0.4;
+      }
+    }
+  }
+
+  draw(ctx,viewL,viewR,viewT,viewB,player){
+    for(const obj of this.objects){
+      if(!obj.alive&&!obj.absorbing)continue;
+      // 视口裁剪
+      if(obj.x+obj.radius<viewL||obj.x-obj.radius>viewR)continue;
+      if(obj.y+obj.radius<viewT||obj.y-obj.radius>viewB)continue;
+
+      const scale=obj.absorbing?Math.max(0,obj.scale||0):1;
+      const r=obj.radius*scale;
+      if(r<0.5)continue;
+
+      // 吞噬时螺旋坠入
+      let rx=obj.x,ry=obj.y,rot=0;
+      if(obj.absorbing){
+        const t=1-scale;
+        rx=obj.x+(obj.absorbX-obj.x)*t*t;
+        ry=obj.y+(obj.absorbY-obj.y)*t*t;
+        rot=t*Math.PI*3;
+      }
+
+      // 可吞噬高亮
+      const pd=player?Math.hypot(obj.x-player.x,obj.y-player.y):Infinity;
+      const canEat=player&&!obj.absorbing&&player.radius>=obj.radius&&pd<300;
+      const drawColor=canEat?'#00ff88':obj.color;
+
+      // 从精灵缓存贴图
+      const sprite=_SC[obj.name+'|'+drawColor];
+      if(!sprite)continue;
+
+      // 最低可视像素尺寸：小物体在远处不会小于 8px
+      const s=Math.max(r,8)/_SC_R;
+      const sz=_SC_SZ*s;
+
+      ctx.save();
+      ctx.globalAlpha=obj.absorbing?scale:1;
+      ctx.translate(rx,ry);
+      if(rot)ctx.rotate(rot);
+      ctx.drawImage(sprite,-sz/2,-sz/2,sz,sz);
+      ctx.restore();
+    }
+  }
+}
+
+// ==================== 启动 ====================
+const game=new Game();
+game.start();
+</script>
+</body>
+</html>
