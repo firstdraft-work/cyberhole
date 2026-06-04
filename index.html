@@ -23,7 +23,7 @@ const ABSORB_ANIM=0.3;             // 吞噬动画时长(秒)
 const RESPAWN_DELAY=4;              // 物体重生延迟(秒)
 const COMBO_WINDOW=1;               // 连击窗口(秒)
 const COMBO_ABS_CAP=3;              // 连击绝对上限(秒)
-const EAT_RATIO=1.3;                // 互吃需要的体型比
+const EAT_RATIO=1.15;               // 互吃需要的体型比（半径比）
 const INVINCIBLE_TIME=2;            // 无敌时间(秒)
 const MAX_PARTICLES=300;            // 粒子上限
 const PARTICLE_LIFE=30;             // 粒子存活帧数
@@ -748,7 +748,8 @@ class Game{
         const a=all[i],b=all[j];
         if(a.invincible>0||b.invincible>0)continue;
         const d=dist(a,b);
-        if(d<a.radius&&a.radius>=b.radius*EAT_RATIO){
+        // 吞噬条件：覆盖距离 + 体型比
+        if(d<a.radius*0.6+b.radius*0.4&&a.radius>=b.radius*EAT_RATIO){
           this.eatHole(a,b);
         }
       }
